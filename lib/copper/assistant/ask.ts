@@ -4,19 +4,43 @@
 // the model through callStream (lib/ai/call.ts), with or without the tools,
 // and sends back each step as it happens, so the panel can show Copper
 // thinking and using its tools.
-import { stepCountIs } from "ai";
+import { stepCountIs, tool } from "ai";
+import { z } from "zod";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
 import { COPPER_INSTRUCTIONS } from "@/lib/copper/assistant/instructions";
 import type { Progress, ToolStep } from "@/lib/copper/assistant/progress";
 import { copperTools } from "@/lib/copper/assistant/tools";
+import type { RefundContext } from "@/lib/copper/refunds/orders";
+import { runRefundAgent } from "@/lib/copper/refunds/refund-agent";
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
 export type AskCopperRequest = {
   messages: ChatMessage[];
   useTools: boolean;
+  /** On the Support page: the customer's orders and the auto-refund limit. */
+  refunds?: RefundContext;
 };
+
+/** Copper's hand-off to the Refund agent, bound to this page's orders and limit. */
+function refundTools(context: RefundContext) {
+  return {
+    hand_off_to_refund_agent: tool({
+      description:
+        "Hands a customer's refund request to the Refund agent, which looks up their orders and asks the app for the refund. Use it whenever the customer wants money back for an order.",
+      inputSchema: z.object({
+        request: z
+          .string()
+          .min(2)
+          .describe(
+            "The customer's refund request in their words, with the order number or item if they gave one.",
+          ),
+      }),
+      execute: async ({ request }) => runRefundAgent(request, context),
+    }),
+  };
+}
 
 export type AskCopperResult = { progress: Live<Progress> };
 
@@ -28,6 +52,7 @@ const SORRY = "Sorry, something went wrong on my end. Please try again.";
 export async function askCopper({
   messages,
   useTools,
+  refunds,
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const progress: Progress = { steps: [], reply: "", status: "working" };
@@ -51,7 +76,9 @@ export async function askCopper({
       providerOptions: THOUGHT_SUMMARIES,
       ...(useTools && {
         instructions: COPPER_INSTRUCTIONS,
-        tools: copperTools,
+        tools: refunds
+          ? { ...copperTools, ...refundTools(refunds) }
+          : copperTools,
         stopWhen: stepCountIs(MAX_STEPS),
       }),
     },

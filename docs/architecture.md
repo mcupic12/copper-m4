@@ -139,3 +139,20 @@ second agent, and a person approving the large ones.
 |---|---|---|
 | Page | `app/support/page.tsx` | The "Refund Console" title and nothing else yet, linked from the header as Support |
 | Chat panel | `components/copper/ask-copper.tsx` | With the `docked` prop it starts open and the page beside it stays clickable. It is the same single agent and tools as on the home page |
+
+## Module 4: refunds and the Refund agent
+
+**Summary:** On the Support page, Copper hands refund requests to a second
+agent, the Refund agent. The Refund agent finds the order and asks the app for
+the refund; plain code compares the amount with the auto-refund limit. At or
+under the limit it's refunded at once; over it, it waits in the Refund Console
+for a person to Approve or Reject, and the chat tells the customer the outcome.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Orders and rule | `lib/copper/refunds/orders.ts` | Maya Reyes's four orders, the default $50 limit, and `decideRefund()`: the code decision (refunded, pending_approval or not_refundable) |
+| Refund agent | `lib/copper/refunds/refund-agent.ts` | `runRefundAgent()`: its own instructions and tools (`list_orders`, `request_refund`), one `callText` per hand-off |
+| Hand-off | `hand_off_to_refund_agent` in `lib/copper/assistant/ask.ts` | Copper's tool, added only when the Support page sends its orders and limit |
+| Shared state | `lib/copper/refunds/store.ts` | Orders, limit and Approve/Reject decisions in the browser (localStorage), shared by the Console and the chat |
+| Console | `components/copper/refund-console.tsx` | The limit field, refunds waiting for approval with Approve and Reject, and the orders list |
+| AI calls | `{ module: 4, feature: "refund-agent" }` | One call per hand-off, inside Copper's own streamed call |

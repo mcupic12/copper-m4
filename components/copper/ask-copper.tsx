@@ -35,6 +35,14 @@ import {
   TOOL_LABELS,
 } from "@/lib/copper/assistant/progress";
 import { formatUsd, getPlans, getProducts } from "@/lib/copper/catalog";
+import { CUSTOMER, type RefundDecision } from "@/lib/copper/refunds/orders";
+import {
+  applyDecision,
+  getRefunds,
+  reviewMessage,
+  updateRefunds,
+  useRefunds,
+} from "@/lib/copper/refunds/store";
 import { cn } from "@/lib/utils";
 
 const STARTERS = [
@@ -43,7 +51,8 @@ const STARTERS = [
   "Is Copper Plus cheaper monthly or yearly?",
 ];
 
-type Turn = { question: string; progress: Progress };
+/** A notice is a message from Copper with no question, like a refund update. */
+type Turn = { question: string; progress: Progress; notice?: boolean };
 type Chats = { tools: Turn[]; noTools: Turn[] };
 
 const WORKING: Progress = { steps: [], reply: "", status: "working" };
@@ -86,6 +95,37 @@ export function AskCopper({
     if (body.current) body.current.scrollTop = body.current.scrollHeight;
   }, [chats, useTools]);
 
+  // On the Support page, tell the customer when a person approves or rejects
+  // a refund in the Refund Console. Only decisions made after the chat opened.
+  const { reviews } = useRefunds();
+  // Set in the browser only: reading the clock while the page is prerendered
+  // fails the build.
+  const openedAt = useRef<number | null>(null);
+  const announced = useRef(new Set<number>());
+  useEffect(() => {
+    openedAt.current ??= Date.now();
+  }, []);
+  useEffect(() => {
+    if (!docked || openedAt.current === null) return;
+    const since = openedAt.current;
+    const fresh = reviews.filter(
+      (r) => r.at >= since && !announced.current.has(r.id),
+    );
+    if (fresh.length === 0) return;
+    fresh.forEach((r) => announced.current.add(r.id));
+    setChats((all) => ({
+      ...all,
+      tools: [
+        ...all.tools,
+        ...fresh.map((r): Turn => ({
+          question: "",
+          notice: true,
+          progress: { steps: [], reply: reviewMessage(r), status: "done" },
+        })),
+      ],
+    }));
+  }, [docked, reviews]);
+
   async function send(question: string) {
     question = question.trim();
     if (!question || busy) return;
@@ -94,27 +134,53 @@ export function AskCopper({
     const index = turns.length;
     // Only finished turns go to the model: questions and Copper's replies.
     const messages: ChatMessage[] = [
-      ...turns.flatMap(({ question, progress }): ChatMessage[] => [
-        { role: "user", content: question },
+      ...turns.flatMap(({ question, progress, notice }): ChatMessage[] => [
+        ...(notice ? [] : [{ role: "user" as const, content: question }]),
         { role: "assistant", content: progress.reply },
       ]),
       { role: "user", content: question },
     ];
-    const setProgress = (progress: Progress) =>
+    // Record the app's refund decision as soon as the Refund agent gets it.
+    const recorded = new Set<string>();
+    const setProgress = (progress: Progress) => {
+      if (docked)
+        for (const step of progress.steps) {
+          const decision = (step as ToolStep).output as
+            { decision?: RefundDecision | null } | undefined;
+          if (
+            step.type === "tool" &&
+            step.name === "hand_off_to_refund_agent" &&
+            step.state === "done" &&
+            decision?.decision &&
+            !recorded.has(step.id)
+          ) {
+            recorded.add(step.id);
+            updateRefunds((s) => applyDecision(s, decision.decision!));
+          }
+        }
       setChats((all) => ({
         ...all,
         [chat]: all[chat].map((turn, i) =>
           i === index ? { ...turn, progress } : turn,
         ),
       }));
+    };
     setChats((all) => ({
       ...all,
       [chat]: [...all[chat], { question, progress: WORKING }],
     }));
     try {
+      const refunds = getRefunds();
       const { progress } = await askCopper({
         messages,
         useTools: chat === "tools",
+        ...(docked && {
+          refunds: {
+            customer: CUSTOMER,
+            limitUsd: refunds.limitUsd,
+            orders: refunds.orders,
+          },
+        }),
       });
       for await (const update of readLive(progress)) setProgress(update);
     } catch {
@@ -194,14 +260,27 @@ export function AskCopper({
                 ref={body}
                 className="bg-secondary flex-1 space-y-6 overflow-y-auto px-4 py-5"
               >
-                {turns.map((turn, i) => (
-                  <div key={i} className="space-y-4">
-                    <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
-                      {turn.question}
-                    </p>
-                    <Answer progress={turn.progress} useTools={useTools} />
-                  </div>
-                ))}
+                {turns.map((turn, i) =>
+                  turn.notice ? (
+                    <div
+                      key={i}
+                      data-testid="refund-update"
+                      className="bg-card rounded-2xl rounded-tl-sm border p-4 text-sm shadow-sm"
+                    >
+                      <p className="text-primary mb-1 text-xs font-bold">
+                        Copper · Refund update
+                      </p>
+                      <p>{turn.progress.reply}</p>
+                    </div>
+                  ) : (
+                    <div key={i} className="space-y-4">
+                      <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
+                        {turn.question}
+                      </p>
+                      <Answer progress={turn.progress} useTools={useTools} />
+                    </div>
+                  ),
+                )}
                 {!busy && (
                   <div className="space-y-2">
                     {turns.length === 0 && (
@@ -656,6 +735,8 @@ function ToolOutput({ name, output }: { name: string; output: any }) {
         ))}
       </ol>
     );
+  if (name === "hand_off_to_refund_agent" && output?.agent)
+    return <RefundHandOff output={output} />;
   // A tool without its own layout yet: show what came back as plain text.
   return (
     <pre className="max-h-48 overflow-auto text-xs whitespace-pre-wrap">
@@ -706,3 +787,58 @@ function Pill({
     </span>
   );
 }
+
+const DECISION_PILL: Record<string, { label: string; className: string }> = {
+  refunded: {
+    label: "Refunded automatically",
+    className: "bg-accent text-white",
+  },
+  pending_approval: {
+    label: "Waiting for a person to approve",
+    className: "bg-chart-4 text-chart-5",
+  },
+  not_refundable: {
+    label: "Not refundable",
+    className: "bg-chart-3 text-white",
+  },
+};
+
+/* eslint-disable @typescript-eslint/no-explicit-any -- tool outputs arrive untyped from the stream */
+/** The Refund agent's own work: the tools it used and what the app decided. */
+function RefundHandOff({ output }: { output: any }) {
+  const decision = output.decision;
+  const pill = decision ? DECISION_PILL[decision.status] : null;
+  return (
+    <div className="space-y-2 text-xs">
+      <p className="font-semibold">
+        {output.agent} took over for {CUSTOMER}
+      </p>
+      <ol className="text-muted-foreground list-decimal space-y-0.5 pl-4">
+        {output.steps.map((step: any, i: number) => (
+          <li key={i}>
+            <span className="text-foreground font-mono">{step.tool}()</span>
+            {step.tool === "request_refund" &&
+              ` for order #${step.input.orderId}`}
+          </li>
+        ))}
+      </ol>
+      {decision?.status === "not_refundable" ? (
+        <p>
+          <Pill className={pill!.className}>{pill!.label}</Pill>{" "}
+          {decision.reason}
+        </p>
+      ) : decision ? (
+        <p className="flex flex-wrap items-center gap-2">
+          <Pill className={pill!.className}>{pill!.label}</Pill>#
+          {decision.orderId} · {decision.item} · {formatUsd(decision.amountUsd)}
+          <span className="text-muted-foreground">
+            (limit {formatUsd(decision.limitUsd)})
+          </span>
+        </p>
+      ) : (
+        <p className="text-muted-foreground">No refund was requested yet.</p>
+      )}
+    </div>
+  );
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
